@@ -33,6 +33,7 @@
  * Copyright (c) 2019, 2020 by Christian Schwarz. All rights reserved.
  */
 
+#include "thread_pool.h"
 #include <assert.h>
 #include <ctype.h>
 #include <sys/debug.h>
@@ -121,6 +122,7 @@ static int zfs_do_project(int argc, char **argv);
 static int zfs_do_version(int argc, char **argv);
 static int zfs_do_redact(int argc, char **argv);
 static int zfs_do_wait(int argc, char **argv);
+static int zfs_do_rebalance(int argc, char **argv);
 
 #ifdef __FreeBSD__
 static int zfs_do_jail(int argc, char **argv);
@@ -197,6 +199,7 @@ typedef enum {
 	HELP_WAIT,
 	HELP_ZONE,
 	HELP_UNZONE,
+	HELP_REBALANCE,
 } zfs_help_t;
 
 typedef struct zfs_command {
@@ -262,6 +265,8 @@ static zfs_command_t command_table[] = {
 	{ "change-key",	zfs_do_change_key,	HELP_CHANGE_KEY		},
 	{ "redact",	zfs_do_redact,		HELP_REDACT		},
 	{ "wait",	zfs_do_wait,		HELP_WAIT		},
+	{ NULL },
+	{ "rebalance",	zfs_do_rebalance,	HELP_REBALANCE		},
 
 #ifdef __FreeBSD__
 	{ "jail",	zfs_do_jail,		HELP_JAIL		},
@@ -441,6 +446,8 @@ get_usage(zfs_help_t idx)
 		return (gettext("\tzone <nsfile> <filesystem>\n"));
 	case HELP_UNZONE:
 		return (gettext("\tunzone <nsfile> <filesystem>\n"));
+	case HELP_REBALANCE:
+		return (gettext("\trebalance [-rdfv] [-t num_of_threads] <dataset>\n"));
 	default:
 		__builtin_unreachable();
 	}
@@ -9383,3 +9390,114 @@ zfs_do_unjail(int argc, char **argv)
 	return (zfs_do_jail_impl(argc, argv, B_FALSE));
 }
 #endif
+
+typedef struct rebalance_cbdata {
+	int foo;
+	char *target;
+	boolean_t recursive;
+	boolean_t dry_run;
+	boolean_t foreground;
+	boolean_t verbose;
+	int thread_count;
+	tpool_t *threads;
+} rebalance_cbdata_t;
+
+static int
+starts_with(const char *prefix, const char *s)
+{
+	return strncmp(prefix, s, strlen(prefix));
+}
+
+// TODO: Move to seperate file
+static int
+zfs_rebalance_iter(zfs_handle_t *zhp, void *data) {
+	(void) printf(gettext("Starting callback\n"));
+	rebalance_cbdata_t *cbp = data;
+
+	const char *cur_name = zfs_get_name(zhp);
+
+	(void) printf(gettext("Name: %s\n"), cur_name);
+	(void) printf(gettext("Target name: %s\n"), cbp->target);
+
+	if ((cbp->recursive && starts_with(cbp->target, cur_name) == 0) ||
+		(strcmp(cbp->target, cur_name) == 0)) {
+		(void)printf(gettext("Found name: %s -> %s\n"), cbp->target, cur_name);
+        }
+
+	return 0;
+}
+
+static int
+zfs_do_rebalance(int argc, char **argv)
+{
+	int c;
+
+	rebalance_cbdata_t cb = { 0 };
+	cb.thread_count = 1;
+
+
+	while ((c = getopt(argc, argv, "rdfvt:")) != -1) {
+		switch (c) {
+		case 'r':
+			cb.recursive = B_TRUE;
+			break;
+		case 'd':
+			cb.dry_run = B_TRUE;
+			break;
+		case 'f':
+			cb.foreground = B_TRUE;
+			break;
+		case 'v':
+			cb.verbose = B_TRUE;
+			break;
+		case 't':
+			cb.thread_count = atoi(optarg);
+			break;
+		case '?':
+			(void) fprintf(stderr, gettext("invalid option '%c'\n"),
+			    optopt);
+			usage(B_FALSE);
+		}
+	}
+	if (cb.dry_run) {
+		(void) printf(gettext("Dry run\n"));
+	}
+
+	if (cb.recursive) {
+		(void) printf(gettext("Recursive\n"));
+	}
+
+	if (cb.foreground) {
+		(void) printf(gettext("Running in foreground.  Press Ctrl+C to kill ...\n"));
+	}
+
+	if (cb.verbose) {
+		(void) printf(gettext("Running in verbose mode\n"));
+	}
+
+	(void) printf(gettext("Running on %d threads\n"), cb.thread_count);
+
+	int flags = 0;
+
+	cb.threads = tpool_create(1, cb.thread_count, 0, NULL);
+
+	// NOTE: If target ends in a trailing slash, and you specify recursive,
+	// this will rebalance all the children but NOT the target.
+	cb.target = argv[optind];
+
+	if (!cb.target) {
+		// TODO: set errno?
+		usage(B_FALSE);
+		return -1;
+	}
+
+	// TODO: snapshots?
+	zfs_for_each(0, NULL, flags, ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME, NULL, NULL, 0, zfs_rebalance_iter, &cb);
+
+	tpool_wait(cb.threads);
+	tpool_destroy(cb.threads);
+
+	(void) printf(gettext("Done!\n"));
+
+	return 0;
+}
