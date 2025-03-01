@@ -33,9 +33,12 @@
  * Copyright (c) 2019, 2020 by Christian Schwarz. All rights reserved.
  */
 
+#include "sys/stdtypes.h"
 #include "thread_pool.h"
 #include <assert.h>
 #include <ctype.h>
+#include <dirent.h>
+#include <linux/limits.h>
 #include <sys/debug.h>
 #include <errno.h>
 #include <getopt.h>
@@ -9408,21 +9411,87 @@ starts_with(const char *prefix, const char *s)
 	return strncmp(prefix, s, strlen(prefix));
 }
 
+static void
+zfs_directory_iter(libzfs_handle_t *lzhp, const char *dataset, const char *path, const int level) {
+	DIR *dir = opendir(path);
+	if (!dir) {
+		fprintf(stderr, "Dataset mountpoint could not be opened, skipping...\n");
+		return;
+	}
+
+	char full_path[PATH_MAX] = {0};
+	char full_dataset[PATH_MAX] = {0};
+	struct stat path_stat;
+
+	// TODO: Check on child datasets
+	struct dirent *entry;
+	while ((entry = readdir(dir)) != NULL) {
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+			continue;
+		}
+		for (int i = 0; i < level; i++) {
+			(void) printf("  ");
+		}
+		(void) printf("- %s\n", entry->d_name);
+
+		// Construct full path
+		snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+		snprintf(full_dataset, sizeof(full_dataset), "%s/%s", dataset, entry->d_name);
+
+		// Get file status
+		if (lstat(full_path, &path_stat) != 0) {
+			perror("lstat failed");
+			continue;
+		}
+
+		for (int i = 0; i < level; i++) {
+			(void) printf("  ");
+		}
+		(void) printf("%s\n", full_path);
+
+		if (S_ISDIR(path_stat.st_mode)) {
+			if (!zfs_dataset_exists(lzhp, full_dataset, ZFS_TYPE_FILESYSTEM)) {
+				// Not a separate dataset; recurse
+				zfs_directory_iter(lzhp, dataset, full_path, level + 1);
+			}
+		}
+	}
+	closedir(dir);
+
+}
+
 // TODO: Move to seperate file
 static int
 zfs_rebalance_iter(zfs_handle_t *zhp, void *data) {
-	(void) printf(gettext("Starting callback\n"));
 	rebalance_cbdata_t *cbp = data;
 
 	const char *cur_name = zfs_get_name(zhp);
 
-	(void) printf(gettext("Name: %s\n"), cur_name);
-	(void) printf(gettext("Target name: %s\n"), cbp->target);
+	// Temp only work for datasets
+	if (zfs_get_type(zhp) != ZFS_TYPE_FILESYSTEM) {
+		return 0;
+	}
 
-	if ((cbp->recursive && starts_with(cbp->target, cur_name) == 0) ||
-		(strcmp(cbp->target, cur_name) == 0)) {
-		(void)printf(gettext("Found name: %s -> %s\n"), cbp->target, cur_name);
+	if ((cbp->recursive && starts_with(cbp->target, cur_name) != 0) ||
+		(!cbp->recursive && strcmp(cbp->target, cur_name) != 0)) {
+		return 0;
         }
+
+	(void) printf(gettext("Found target:         %s -> %s\n"), cbp->target, cur_name);
+
+	char mountpoint[ZFS_MAXPROPLEN] = {0};
+
+	verify(zfs_prop_get(zhp, ZFS_PROP_MOUNTPOINT, mountpoint, sizeof(mountpoint), NULL, NULL, 0, B_FALSE) == 0);
+	(void) printf(gettext("Target is mounted at: %s -> %s\n"), cbp->target, mountpoint);
+
+	if (strcmp(mountpoint, "legacy") == 0 || strcmp(mountpoint, "none") == 0) {
+		fprintf(stderr, "Dataset is not mounted or is legacy-mounted, skipping...\n");
+		return 0;
+	}
+
+	libzfs_handle_t *lzhp = zfs_get_handle(zhp);
+
+	zfs_directory_iter(lzhp, cur_name, mountpoint, 1);
 
 	return 0;
 }
