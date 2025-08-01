@@ -37,6 +37,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/list.h>
+#include <sys/zfs_ioctl.h>
 #include <sys/zfs_project.h>
 
 #include "zfs_util.h"
